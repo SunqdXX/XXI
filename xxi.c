@@ -130,6 +130,14 @@ static struct {
     int panefocus;
     int panedone;
     int panestatus;
+    int paneoff;
+    int pselon;
+    int pdrag;
+    int pedge;
+    int psay;
+    int psax;
+    int psby;
+    int psbx;
     int panewait;
     int runconfirm;
     char panecmd[4096];
@@ -188,6 +196,7 @@ static void pane_resize(void);
 static void pane_newline(void);
 static void pane_write(const char *s, int n);
 static void pane_finish(void);
+static void psel_span(int *sy, int *sx, int *ey, int *ex);
 static int stdin_ready(int ms);
 
 static void emitn(const char *s, int n)
@@ -1103,6 +1112,46 @@ fallback:
     return xmemdup(clipbuf, cliplen);
 }
 
+static char *psel_text(int *outlen)
+{
+    int sy, sx, ey, ex, i;
+    Buf t;
+    memset(&t, 0, sizeof t);
+    psel_span(&sy, &sx, &ey, &ex);
+    if (sy < 0) sy = 0;
+    if (ey >= pn) ey = pn - 1;
+    for (i = sy; i <= ey && i < pn; i++) {
+        int a = i == sy ? sx : 0;
+        int b = i == ey ? ex : pl[i].len;
+        if (a > pl[i].len) a = pl[i].len;
+        if (b > pl[i].len) b = pl[i].len;
+        while (b > a && pl[i].s[b - 1] == ' ') b--;
+        if (b > a) bput(&t, pl[i].s + a, b - a);
+        if (i < ey) bput(&t, "\n", 1);
+    }
+    *outlen = t.len;
+    if (!t.b) t.b = xmemdup("", 0);
+    return t.b;
+}
+
+static void cmd_copy_pane(void)
+{
+    int len;
+    char *s = psel_text(&len);
+    if (len == 0) {
+        free(s);
+        E.pselon = 0;
+        set_msg("nothing selected in the terminal");
+        return;
+    }
+    clip_set(s, len);
+    free(s);
+    E.pselon = 0;
+    E.pdrag = 0;
+    E.pedge = 0;
+    set_msg("copied %d byte%s from the terminal", len, plural(len));
+}
+
 static void cmd_copy(void)
 {
     int len;
@@ -1301,6 +1350,49 @@ static int find_at(int y, int x)
     return 0;
 }
 
+static int pane_col_to_byte(const PLine *l, int col)
+{
+    int i = 0, c = 0;
+    while (i < l->len && c < col) {
+        i++;
+        while (i < l->len && u8_cont((unsigned char)l->s[i])) i++;
+        c++;
+    }
+    return i;
+}
+
+static void pane_clamp_off(void)
+{
+    int maxoff = pn - E.panerows;
+    if (maxoff < 0) maxoff = 0;
+    if (E.paneoff > maxoff) E.paneoff = maxoff;
+    if (E.paneoff < 0) E.paneoff = 0;
+}
+
+static int pane_first(void)
+{
+    int f;
+    pane_clamp_off();
+    f = pn - E.panerows - E.paneoff;
+    if (f < 0) f = 0;
+    return f;
+}
+
+static void psel_span(int *sy, int *sx, int *ey, int *ex)
+{
+    if (E.psay < E.psby || (E.psay == E.psby && E.psax <= E.psbx)) {
+        *sy = E.psay;
+        *sx = E.psax;
+        *ey = E.psby;
+        *ex = E.psbx;
+    } else {
+        *sy = E.psby;
+        *sx = E.psbx;
+        *ey = E.psay;
+        *ex = E.psax;
+    }
+}
+
 static void pane_clear(void)
 {
     int i;
@@ -1310,6 +1402,10 @@ static void pane_clear(void)
     pcx = 0;
     pstate = 0;
     pseqlen = 0;
+    E.paneoff = 0;
+    E.pselon = 0;
+    E.pdrag = 0;
+    E.pedge = 0;
 }
 
 static void pane_newline(void)
@@ -1328,7 +1424,14 @@ static void pane_newline(void)
         for (i = 0; i < drop; i++) free(pl[i].s);
         memmove(pl, pl + drop, sizeof(PLine) * (size_t)(pn - drop));
         pn -= drop;
+        E.psay -= drop;
+        E.psby -= drop;
+        if (E.psay < 0 || E.psby < 0) E.pselon = 0;
+        if (E.psay < 0) E.psay = 0;
+        if (E.psby < 0) E.psby = 0;
     }
+    if (E.paneoff > 0) E.paneoff++;
+    pane_clamp_off();
     pcur = pn - 1;
     pcx = 0;
 }
@@ -1883,6 +1986,9 @@ static const char *hints_pane[] = {
     "keys go to",
     "the program",
     "",
+    "drag   to copy",
+    "wheel  scrolls",
+    "",
     "^T   editor",
     "^C   interrupt",
     "esc  close",
@@ -1891,6 +1997,10 @@ static const char *hints_pane[] = {
 
 static const char *hints_done[] = {
     "OUTPUT",
+    "",
+    "drag   to copy",
+    "^C     copy it",
+    "wheel  scrolls",
     "",
     "^T   run again",
     "esc  close",
@@ -2067,7 +2177,8 @@ static void draw_text(Buf *ab)
 static void draw_pane(Buf *ab)
 {
     char head[256];
-    int used, i, k, first = pn - E.panerows;
+    int used, i, k, sy, sx, ey, ex;
+    int first = pane_first();
     if (!E.panecmd[0])
         snprintf(head, sizeof head, " terminal  %s ",
                  E.panefocus ? "^T editor  esc close" : "^T focus  esc close");
@@ -2092,13 +2203,39 @@ static void draw_pane(Buf *ab)
     bstr(ab, c_off);
     bstr(ab, "\r\n");
     if (first < 0) first = 0;
+    psel_span(&sy, &sx, &ey, &ex);
     for (i = 0; i < E.panerows; i++) {
         int idx = first + i;
+        bstr(ab, c_off);
         bstr(ab, "\x1b[K");
         if (idx >= 0 && idx < pn) {
-            int len = pl[idx].len;
-            if (len > E.cols) len = E.cols;
-            bput(ab, pl[idx].s, len);
+            PLine *l = &pl[idx];
+            int a = -1, b = -1, bi = 0, colc = 0, on = 0;
+            if (E.pselon && idx >= sy && idx <= ey) {
+                a = idx == sy ? sx : 0;
+                b = idx == ey ? ex : l->len;
+                if (a > l->len) a = l->len;
+                if (b > l->len) b = l->len;
+            }
+            while (bi < l->len && colc < E.cols) {
+                int nx = bi + 1;
+                int want;
+                while (nx < l->len && u8_cont((unsigned char)l->s[nx])) nx++;
+                want = a >= 0 && bi >= a && bi < b;
+                if (want != on) {
+                    bstr(ab, want ? c_sel : c_off);
+                    on = want;
+                }
+                bput(ab, l->s + bi, nx - bi);
+                bi = nx;
+                colc++;
+            }
+            if (a >= 0 && b > l->len - 1 && idx != ey && colc < E.cols) {
+                bstr(ab, c_sel);
+                bput(ab, " ", 1);
+                on = 1;
+            }
+            if (on) bstr(ab, c_off);
         }
         bstr(ab, "\r\n");
     }
@@ -2373,6 +2510,18 @@ static void mouse_to_buf(int mx, int my, int *py, int *px)
     *px = rx_to_cx(&E.row[*py], rx);
 }
 
+static void mouse_to_pane(int mx, int my, int *ly, int *lx)
+{
+    int row = my - (text_top() + text_height() + 1) - 1;
+    int first = pane_first();
+    if (row < 0) row = 0;
+    if (row >= E.panerows) row = E.panerows - 1;
+    *ly = first + row;
+    if (*ly >= pn) *ly = pn > 0 ? pn - 1 : 0;
+    if (*ly < 0) *ly = 0;
+    *lx = pn > 0 ? pane_col_to_byte(&pl[*ly], mx > 0 ? mx - 1 : 0) : 0;
+}
+
 static void handle_mouse(void)
 {
     int y, x;
@@ -2381,8 +2530,15 @@ static void handle_mouse(void)
     int wheel = (ms_b & 64) != 0;
     int ty0 = text_top();
     int th = text_height();
-    if (E.panefocus) return;
+    int head = ty0 + th + 1;
+    int inpane = E.paneopen && ms_y >= head && ms_y <= head + E.panerows;
     if (wheel) {
+        if (inpane) {
+            E.paneoff += (ms_b & 1) ? -3 : 3;
+            pane_clamp_off();
+            return;
+        }
+        if (E.panefocus) return;
         E.rowoff += (ms_b & 1) ? 3 : -3;
         if (E.rowoff > E.nrow - 1) E.rowoff = E.nrow - 1;
         if (E.rowoff < 0) E.rowoff = 0;
@@ -2395,8 +2551,33 @@ static void handle_mouse(void)
     if (!ms_press) {
         E.dragging = 0;
         E.dragedge = 0;
+        E.pdrag = 0;
+        E.pedge = 0;
         return;
     }
+    if (inpane) {
+        mouse_to_pane(ms_x, ms_y, &y, &x);
+        if (!motion) {
+            E.psay = y;
+            E.psax = x;
+            E.psby = y;
+            E.psbx = x;
+            E.pselon = 0;
+            E.pdrag = 1;
+            E.pedge = 0;
+        } else if (E.pdrag) {
+            E.psby = y;
+            E.psbx = x;
+            E.pselon = 1;
+            E.panefocus = 0;
+            if (ms_y <= head + 1) E.pedge = -1;
+            else if (ms_y >= head + E.panerows) E.pedge = 1;
+            else E.pedge = 0;
+        }
+        return;
+    }
+    E.pselon = 0;
+    E.panefocus = 0;
     if (ms_x > text_width()) return;
     mouse_to_buf(ms_x, ms_y, &y, &x);
     if (!motion) {
@@ -2415,6 +2596,21 @@ static void handle_mouse(void)
         else if (ms_y > ty0 + th) E.dragedge = 1;
         else E.dragedge = 0;
     }
+}
+
+static void pane_drag_scroll(void)
+{
+    int first, ly;
+    if (!E.pdrag || !E.pedge || pn == 0) return;
+    E.paneoff += E.pedge > 0 ? -1 : 1;
+    pane_clamp_off();
+    first = pane_first();
+    ly = E.pedge > 0 ? first + E.panerows - 1 : first;
+    if (ly >= pn) ly = pn - 1;
+    if (ly < 0) ly = 0;
+    E.psby = ly;
+    E.psbx = E.pedge > 0 ? pl[ly].len : 0;
+    E.pselon = 1;
 }
 
 static void drag_scroll(void)
@@ -2527,7 +2723,10 @@ static void process_key(void)
         handle_mouse();
         return;
     }
-    if (c != KCTRL('c')) E.marked = 0;
+    if (c != KCTRL('c')) {
+        E.marked = 0;
+        E.pselon = 0;
+    }
     if (E.findopen) {
         find_key(c);
         return;
@@ -2542,7 +2741,8 @@ static void process_key(void)
         else set_msg("quit XXI?  enter = yes, any other key = no");
         break;
     case KCTRL('c'):
-        cmd_copy();
+        if (E.pselon) cmd_copy_pane();
+        else cmd_copy();
         break;
     case KCTRL('v'):
         cmd_paste();
@@ -2654,14 +2854,31 @@ static void pane_keys(void)
 {
     char b[512];
     ssize_t r = read(STDIN_FILENO, b, sizeof b);
-    int i, start = 0;
+    int i = 0, start = 0;
     if (r <= 0) return;
-    for (i = 0; i < (int)r; i++) {
+    while (i < (int)r) {
         if (b[i] == KCTRL('t')) {
             if (i > start) pane_write(b + start, i - start);
             E.panefocus = 0;
             set_msg("editor focused  - ^T returns to the terminal");
             return;
+        }
+        if (b[i] == '\x1b' && i + 2 < (int)r && b[i + 1] == '[' && b[i + 2] == '<') {
+            int j = i + 3;
+            while (j < (int)r && b[j] != 'M' && b[j] != 'm') j++;
+            if (j < (int)r) {
+                char save = b[j];
+                if (i > start) pane_write(b + start, i - start);
+                b[j] = '\0';
+                if (sscanf(b + i + 3, "%d;%d;%d", &ms_b, &ms_x, &ms_y) == 3) {
+                    ms_press = save == 'M';
+                    handle_mouse();
+                }
+                i = j + 1;
+                start = i;
+                if (!E.panefocus) return;
+                continue;
+            }
         }
         if (b[i] == '\x1b' && i == (int)r - 1 && !stdin_ready(50)) {
             if (i > start) pane_write(b + start, i - start);
@@ -2669,6 +2886,7 @@ static void pane_keys(void)
             set_msg("terminal closed");
             return;
         }
+        i++;
     }
     pane_write(b + start, (int)r - start);
 }
@@ -2745,7 +2963,9 @@ int main(int argc, char **argv)
             n = 2;
         }
         r = poll(pf, (nfds_t)n,
-                 (E.dragging && E.dragedge) ? 60 : (E.msg[0] ? 400 : -1));
+                 ((E.dragging && E.dragedge) || (E.pdrag && E.pedge))
+                     ? 60
+                     : (E.msg[0] ? 400 : -1));
         if (r < 0) {
             if (errno == EINTR) continue;
             die("poll");
@@ -2756,6 +2976,7 @@ int main(int argc, char **argv)
             else process_key();
         } else if (r == 0) {
             drag_scroll();
+            pane_drag_scroll();
         }
     }
     return 0;
