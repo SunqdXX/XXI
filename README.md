@@ -11,20 +11,21 @@ One file of C. No libraries. It just works.
 ```sh
 git clone https://github.com/SunqdXX/XXI.git
 cd XXI
-make
-make install
+./install.sh
 ```
 
-That puts `xxi` in `~/.local/bin`. If typing `xxi` says "command not found", add this to your `~/.bashrc`:
+That is it. It builds itself and puts `xxi` where your terminal can find it.
+
+**Even shorter** (one line, no cloning):
 
 ```sh
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/SunqdXX/XXI/main/install.sh | sh
 ```
 
-Want it for everyone on the computer instead?
+Want it for everyone on the computer?
 
 ```sh
-sudo make install PREFIX=/usr/local
+sudo ./install.sh
 ```
 
 ---
