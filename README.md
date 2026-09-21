@@ -1,5 +1,7 @@
 # XXI
 
+*The new default.*
+
 **The most basic text editor with code running, undo-redo, and everything a working text editor needs.**
 
 One file of C. No libraries. It just works.
