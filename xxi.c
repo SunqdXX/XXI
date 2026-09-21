@@ -20,10 +20,11 @@
 #define TABSTOP 4
 #define HINTW 18
 #define HINTMIN 68
-#define PANEROWS 10
+#define PANEROWS 16
 #define PANEMAX 4000
 #define MSGSECS 4
 #define KCTRL(k) ((k) & 0x1f)
+#define K_ALT(k) (2000 + (unsigned char)(k))
 
 enum {
     K_BACKSPACE = 127,
@@ -36,8 +37,14 @@ enum {
     K_PGUP,
     K_PGDN,
     K_DEL,
-    K_MOUSE
+    K_MOUSE,
+    K_COPY,
+    K_PASTE
 };
+
+#define KM_SHIFT 1
+#define KM_ALT 2
+#define KM_CTRL 4
 
 enum { OP_INS_TEXT, OP_DEL_TEXT, OP_SPLIT, OP_JOIN, OP_INS_LINES, OP_DEL_LINES };
 enum { TXN_OTHER, TXN_TYPE, TXN_ERASE };
@@ -50,8 +57,29 @@ typedef struct {
     int rlen;
 } Line;
 
+/* One character cell of the runner pane, with the colour it was printed in. */
+#define CA_BOLD 1
+#define CA_DIM 2
+#define CA_ITAL 4
+#define CA_UNDER 8
+#define CA_REV 16
+#define CA_STRIKE 32
+
+/* colour: 0 = the terminal default, 0x01000000|rgb = true colour,
+   0x02000000|n = one of the 256 palette slots */
+#define CC_RGB 0x01000000u
+#define CC_IDX 0x02000000u
+
 typedef struct {
-    char *s;
+    char b[4];
+    unsigned char n;
+    unsigned char fl;
+    unsigned int fg;
+    unsigned int bg;
+} Cell;
+
+typedef struct {
+    Cell *c;
     int len;
     int cap;
 } PLine;
@@ -178,11 +206,23 @@ static int cliplen;
 static PLine *pl;
 static int pn;
 static int pcap;
-static int pcur;
-static int pcx;
+static int ptop;        /* index in pl of the top row of the live screen */
+static int prow;        /* cursor, as a row on that screen */
+static int pcol;
+static int pwrapnext;   /* sitting past the last column: wrap before writing */
+static int pcols;       /* how wide the emulated screen is */
+static int pstop;       /* scroll region, screen rows */
+static int psbot;
+static int pautowrap = 1;
+static int pcurvis = 1;
+static Cell ppen;       /* colours the next character will be written in */
+static int palt;        /* the alternate screen is up */
+static PLine *sv_pl;
+static int sv_pn, sv_pcap, sv_ptop, sv_prow, sv_pcol;
 static int pstate;
 static char pseq[48];
 static int pseqlen;
+static int pbracket;
 static int ms_b;
 static int ms_x;
 static int ms_y;
@@ -259,7 +299,7 @@ static char *xmemdup(const char *s, int n)
 static void disable_raw(void)
 {
     if (raw_active) {
-        emit("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+        emit("\x1b[<u\x1b[23;2t\x1b[?1006l\x1b[?1002l\x1b[?1000l");
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         raw_active = 0;
     }
@@ -286,7 +326,20 @@ static void enable_raw(void)
     t.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &t) == -1) die("tcsetattr");
     raw_active = 1;
-    emit("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+    /* The title is how kitty tells an XXI window apart from any other, so a
+       shortcut can be pointed at XXI alone.  >1u asks for the kitty keyboard
+       protocol, which is the only way ctrl and ctrl+shift arrive as different
+       keys; terminals that do not speak it ignore both and nothing changes. */
+    emit("\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[22;2t\x1b[>1u");
+}
+
+static void set_title(void)
+{
+    const char *base = E.path ? strrchr(E.path, '/') : NULL;
+    char t[256];
+    base = base ? base + 1 : (E.path ? E.path : "");
+    snprintf(t, sizeof t, "\x1b]2;XXI: %.200s\x07", base);
+    emit(t);
 }
 
 static int u8_cont(unsigned char c)
@@ -1121,12 +1174,18 @@ static char *psel_text(int *outlen)
     if (sy < 0) sy = 0;
     if (ey >= pn) ey = pn - 1;
     for (i = sy; i <= ey && i < pn; i++) {
+        PLine *l = &pl[i];
         int a = i == sy ? sx : 0;
-        int b = i == ey ? ex : pl[i].len;
-        if (a > pl[i].len) a = pl[i].len;
-        if (b > pl[i].len) b = pl[i].len;
-        while (b > a && pl[i].s[b - 1] == ' ') b--;
-        if (b > a) bput(&t, pl[i].s + a, b - a);
+        int b = i == ey ? ex : l->len;
+        int k;
+        if (a > l->len) a = l->len;
+        if (b > l->len) b = l->len;
+        while (b > a && (l->c[b - 1].n == 0 ||
+                         (l->c[b - 1].n == 1 && l->c[b - 1].b[0] == ' '))) b--;
+        for (k = a; k < b; k++) {
+            if (l->c[k].n == 0) bput(&t, " ", 1);
+            else bput(&t, l->c[k].b, l->c[k].n);
+        }
         if (i < ey) bput(&t, "\n", 1);
     }
     *outlen = t.len;
@@ -1137,7 +1196,12 @@ static char *psel_text(int *outlen)
 static void cmd_copy_pane(void)
 {
     int len;
-    char *s = psel_text(&len);
+    char *s;
+    if (!E.pselon) {
+        set_msg("nothing selected in the terminal");
+        return;
+    }
+    s = psel_text(&len);
     if (len == 0) {
         free(s);
         E.pselon = 0;
@@ -1146,10 +1210,7 @@ static void cmd_copy_pane(void)
     }
     clip_set(s, len);
     free(s);
-    E.pselon = 0;
-    E.pdrag = 0;
-    E.pedge = 0;
-    set_msg("copied %d byte%s from the terminal", len, plural(len));
+    set_msg("copied %d byte%s from the terminal  (still selected)", len, plural(len));
 }
 
 static void cmd_copy(void)
@@ -1159,11 +1220,7 @@ static void cmd_copy(void)
     clip_set(s, len);
     free(s);
     if (sel_on()) {
-        E.mode = MODE_EDIT;
-        E.marked = 0;
-        E.dragging = 0;
-        E.dragedge = 0;
-        set_msg("copied %d byte%s", len, plural(len));
+        set_msg("copied %d byte%s  (still selected)", len, plural(len));
     } else {
         set_msg("copied line %d", E.cy + 1);
     }
@@ -1350,17 +1407,6 @@ static int find_at(int y, int x)
     return 0;
 }
 
-static int pane_col_to_byte(const PLine *l, int col)
-{
-    int i = 0, c = 0;
-    while (i < l->len && c < col) {
-        i++;
-        while (i < l->len && u8_cont((unsigned char)l->s[i])) i++;
-        c++;
-    }
-    return i;
-}
-
 static void pane_clamp_off(void)
 {
     int maxoff = pn - E.panerows;
@@ -1393,126 +1439,515 @@ static void psel_span(int *sy, int *sx, int *ey, int *ex)
     }
 }
 
-static void pane_clear(void)
+static int pane_rows(void)
 {
-    int i;
-    for (i = 0; i < pn; i++) free(pl[i].s);
-    pn = 0;
-    pcur = 0;
-    pcx = 0;
-    pstate = 0;
-    pseqlen = 0;
-    E.paneoff = 0;
-    E.pselon = 0;
-    E.pdrag = 0;
-    E.pedge = 0;
+    return E.panerows > 0 ? E.panerows : 1;
 }
 
-static void pane_newline(void)
+static Cell pane_blank_cell(void)
+{
+    Cell c;
+    memset(&c, 0, sizeof c);
+    c.bg = ppen.bg;
+    return c;
+}
+
+static void pline_room(PLine *l, int need)
+{
+    if (need <= l->cap) return;
+    if (l->cap == 0) l->cap = 64;
+    while (l->cap < need) l->cap *= 2;
+    l->c = xrealloc(l->c, sizeof(Cell) * (size_t)l->cap);
+}
+
+static void pline_extend(PLine *l, int n)
+{
+    Cell blank = pane_blank_cell();
+    if (n <= l->len) return;
+    pline_room(l, n);
+    while (l->len < n) l->c[l->len++] = blank;
+}
+
+static void pline_clear(PLine *l, int from, int to)
+{
+    Cell blank = pane_blank_cell();
+    int i;
+    if (from < 0) from = 0;
+    if (to > l->len) pline_extend(l, to);
+    for (i = from; i < to && i < l->len; i++) l->c[i] = blank;
+}
+
+static void pane_free_lines(PLine *arr, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) free(arr[i].c);
+    free(arr);
+}
+
+static void pane_addline(void)
 {
     if (pn + 1 > pcap) {
         pcap = pcap ? pcap * 2 : 256;
         pl = xrealloc(pl, sizeof(PLine) * (size_t)pcap);
     }
-    pl[pn].s = xmalloc(64);
-    pl[pn].s[0] = '\0';
+    pl[pn].c = NULL;
     pl[pn].len = 0;
-    pl[pn].cap = 64;
+    pl[pn].cap = 0;
     pn++;
     if (pn > PANEMAX) {
         int drop = pn - PANEMAX, i;
-        for (i = 0; i < drop; i++) free(pl[i].s);
+        for (i = 0; i < drop; i++) free(pl[i].c);
         memmove(pl, pl + drop, sizeof(PLine) * (size_t)(pn - drop));
         pn -= drop;
+        ptop -= drop;
+        if (ptop < 0) ptop = 0;
         E.psay -= drop;
         E.psby -= drop;
         if (E.psay < 0 || E.psby < 0) E.pselon = 0;
         if (E.psay < 0) E.psay = 0;
         if (E.psby < 0) E.psby = 0;
     }
-    if (E.paneoff > 0) E.paneoff++;
-    pane_clamp_off();
-    pcur = pn - 1;
-    pcx = 0;
 }
 
-static void pane_put(char c)
+/* The live screen is always fully backed by lines, so a program can address
+   any row of it even if it has not printed there yet. */
+static void pane_sync(void)
+{
+    int rows = pane_rows(), guard = 0;
+    while (pn < rows && guard++ < PANEMAX + 64) pane_addline();
+    /* The live screen is always the LAST `rows` lines of the buffer; whatever
+       is above them is scrollback. Deriving the top rather than tracking it
+       means the screen and the view cannot drift apart when the window
+       resizes, and the scrollback trim cannot strand the cursor. */
+    ptop = pn - rows;
+    if (ptop < 0) ptop = 0;
+    if (prow < 0) prow = 0;
+    if (prow >= rows) prow = rows - 1;
+    if (pcol < 0) pcol = 0;
+    if (pcols > 0 && pcol >= pcols) pcol = pcols - 1;
+    if (psbot >= rows || psbot <= pstop) {
+        pstop = 0;
+        psbot = rows - 1;
+    }
+}
+
+static PLine *pane_line(int row)
+{
+    pane_sync();
+    if (row < 0) row = 0;
+    if (row >= pane_rows()) row = pane_rows() - 1;
+    return &pl[ptop + row];
+}
+
+static void pane_newline(void)
+{
+    pane_sync();
+}
+
+/* Move the scroll region up one row. When the region is the whole screen the
+   row that falls off the top becomes scrollback instead of being dropped. */
+static void pane_scroll_up(int n)
+{
+    int i, k;
+    for (k = 0; k < n; k++) {
+        pane_sync();
+        if (pstop == 0 && psbot == pane_rows() - 1) {
+            /* Growing the buffer is what advances the screen: ptop follows. */
+            pane_addline();
+            if (E.paneoff > 0) E.paneoff++;
+            pane_sync();
+        } else {
+            PLine dead = pl[ptop + pstop];
+            for (i = pstop; i < psbot; i++) pl[ptop + i] = pl[ptop + i + 1];
+            free(dead.c);
+            pl[ptop + psbot].c = NULL;
+            pl[ptop + psbot].len = 0;
+            pl[ptop + psbot].cap = 0;
+        }
+    }
+    pane_clamp_off();
+}
+
+static void pane_scroll_down(int n)
+{
+    int i, k;
+    for (k = 0; k < n; k++) {
+        PLine dead;
+        pane_sync();
+        dead = pl[ptop + psbot];
+        for (i = psbot; i > pstop; i--) pl[ptop + i] = pl[ptop + i - 1];
+        free(dead.c);
+        pl[ptop + pstop].c = NULL;
+        pl[ptop + pstop].len = 0;
+        pl[ptop + pstop].cap = 0;
+    }
+}
+
+static void pane_index(void)
+{
+    if (prow >= psbot) pane_scroll_up(1);
+    else prow++;
+}
+
+static void pane_rindex(void)
+{
+    if (prow <= pstop) pane_scroll_down(1);
+    else prow--;
+}
+
+static void pane_putcell(const char *b, int n)
 {
     PLine *l;
-    if (pn == 0) pane_newline();
-    l = &pl[pcur];
-    if (pcx + 2 > l->cap) {
-        int n = l->cap ? l->cap : 64;
-        while (n < pcx + 2) n *= 2;
-        l->s = xrealloc(l->s, (size_t)n);
-        l->cap = n;
+    Cell *cc;
+    if (pwrapnext && pautowrap) {
+        pcol = 0;
+        pane_index();
     }
-    while (l->len < pcx) l->s[l->len++] = ' ';
-    l->s[pcx] = c;
-    pcx++;
-    if (pcx > l->len) l->len = pcx;
-    l->s[l->len] = '\0';
+    pwrapnext = 0;
+    if (pcol < 0) pcol = 0;
+    if (pcol >= pcols) pcol = pcols - 1;
+    l = pane_line(prow);
+    pline_extend(l, pcol + 1);
+    cc = &l->c[pcol];
+    if (n > 4) n = 4;
+    memcpy(cc->b, b, (size_t)n);
+    cc->n = (unsigned char)n;
+    cc->fl = ppen.fl;
+    cc->fg = ppen.fg;
+    cc->bg = ppen.bg;
+    if (pcol + 1 >= pcols) pwrapnext = 1;
+    else pcol++;
+}
+
+static void pane_clear(void)
+{
+    pane_free_lines(pl, pn);
+    pl = NULL;
+    pn = 0;
+    pcap = 0;
+    ptop = 0;
+    prow = 0;
+    pcol = 0;
+    pwrapnext = 0;
+    pstate = 0;
+    pseqlen = 0;
+    pstop = 0;
+    pautowrap = 1;
+    pcurvis = 1;
+    memset(&ppen, 0, sizeof ppen);
+    if (pcols <= 0) pcols = 80;
+    psbot = pane_rows() - 1;
+    E.paneoff = 0;
+    E.pselon = 0;
+    E.pdrag = 0;
+    E.pedge = 0;
+    pane_sync();
+}
+
+static void pane_alt(int on)
+{
+    if (on == palt) return;
+    if (on) {
+        sv_pl = pl; sv_pn = pn; sv_pcap = pcap;
+        sv_ptop = ptop;
+        pl = NULL; pn = 0; pcap = 0; ptop = 0; prow = 0; pcol = 0;
+        palt = 1;
+    } else {
+        pane_free_lines(pl, pn);
+        pl = sv_pl; pn = sv_pn; pcap = sv_pcap;
+        ptop = sv_ptop; prow = 0; pcol = 0;
+        sv_pl = NULL; sv_pn = 0; sv_pcap = 0;
+        palt = 0;
+    }
+    pwrapnext = 0;
+    pstop = 0;
+    psbot = pane_rows() - 1;
+    E.paneoff = 0;
+    E.pselon = 0;
+    pane_sync();
+}
+
+/* Split the parameter bytes of a CSI sequence. ':' counts as a separator so
+   the colon form of the colour sequences parses too. */
+static int pane_params(int *v, int max, int *omitted)
+{
+    int n = 0, i = 0, cur = 0, seen = 0;
+    v[0] = 0;
+    omitted[0] = 1;
+    while (i < pseqlen && n < max - 1) {
+        char ch = pseq[i];
+        if (ch >= '0' && ch <= '9') {
+            cur = cur * 10 + (ch - '0');
+            seen = 1;
+        } else if (ch == ';' || ch == ':') {
+            v[n] = cur;
+            omitted[n] = !seen;
+            n++;
+            v[n] = 0;
+            omitted[n] = 1;
+            cur = 0;
+            seen = 0;
+        }
+        i++;
+    }
+    v[n] = cur;
+    omitted[n] = !seen;
+    return n + 1;
+}
+
+static void pane_sgr(const int *v, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        int a = v[i];
+        if (a == 0) { memset(&ppen, 0, sizeof ppen); continue; }
+        if (a == 1) { ppen.fl |= CA_BOLD; continue; }
+        if (a == 2) { ppen.fl |= CA_DIM; continue; }
+        if (a == 3) { ppen.fl |= CA_ITAL; continue; }
+        if (a == 4) { ppen.fl |= CA_UNDER; continue; }
+        if (a == 7) { ppen.fl |= CA_REV; continue; }
+        if (a == 9) { ppen.fl |= CA_STRIKE; continue; }
+        if (a == 21 || a == 22) { ppen.fl &= (unsigned char)~(CA_BOLD | CA_DIM); continue; }
+        if (a == 23) { ppen.fl &= (unsigned char)~CA_ITAL; continue; }
+        if (a == 24) { ppen.fl &= (unsigned char)~CA_UNDER; continue; }
+        if (a == 27) { ppen.fl &= (unsigned char)~CA_REV; continue; }
+        if (a == 29) { ppen.fl &= (unsigned char)~CA_STRIKE; continue; }
+        if (a >= 30 && a <= 37) { ppen.fg = CC_IDX | (unsigned)(a - 30); continue; }
+        if (a >= 90 && a <= 97) { ppen.fg = CC_IDX | (unsigned)(a - 90 + 8); continue; }
+        if (a == 39) { ppen.fg = 0; continue; }
+        if (a >= 40 && a <= 47) { ppen.bg = CC_IDX | (unsigned)(a - 40); continue; }
+        if (a >= 100 && a <= 107) { ppen.bg = CC_IDX | (unsigned)(a - 100 + 8); continue; }
+        if (a == 49) { ppen.bg = 0; continue; }
+        if ((a == 38 || a == 48) && i + 1 < n) {
+            unsigned int col = 0;
+            int got = 0;
+            if (v[i + 1] == 5 && i + 2 < n) {
+                col = CC_IDX | (unsigned)(v[i + 2] & 0xff);
+                got = 1;
+                i += 2;
+            } else if (v[i + 1] == 2 && i + 4 < n) {
+                col = CC_RGB | ((unsigned)(v[i + 2] & 0xff) << 16) |
+                      ((unsigned)(v[i + 3] & 0xff) << 8) | (unsigned)(v[i + 4] & 0xff);
+                got = 1;
+                i += 4;
+            }
+            if (got) {
+                if (a == 38) ppen.fg = col;
+                else ppen.bg = col;
+            }
+        }
+    }
+}
+
+static void pane_erase_display(int mode)
+{
+    int r;
+    pane_sync();
+    if (mode >= 2) {
+        for (r = 0; r < pane_rows(); r++) {
+            pl[ptop + r].len = 0;
+            pline_clear(&pl[ptop + r], 0, pcols);
+        }
+        return;
+    }
+    if (mode == 0) {
+        pline_clear(pane_line(prow), pcol, pcols);
+        for (r = prow + 1; r < pane_rows(); r++) pline_clear(&pl[ptop + r], 0, pcols);
+    } else {
+        pline_clear(pane_line(prow), 0, pcol + 1);
+        for (r = 0; r < prow; r++) pline_clear(&pl[ptop + r], 0, pcols);
+    }
+}
+
+static void pane_erase_line(int mode)
+{
+    PLine *l = pane_line(prow);
+    if (mode == 0) {
+        if (l->len > pcol) l->len = pcol;
+    } else if (mode == 1) {
+        pline_clear(l, 0, pcol + 1);
+    } else {
+        l->len = 0;
+    }
+}
+
+static void pane_ins_del_chars(int n, int del)
+{
+    PLine *l = pane_line(prow);
+    Cell blank = pane_blank_cell();
+    int i;
+    if (n < 1) n = 1;
+    pline_extend(l, pcols);
+    if (del) {
+        for (i = pcol; i < pcols; i++)
+            l->c[i] = (i + n < pcols) ? l->c[i + n] : blank;
+    } else {
+        for (i = pcols - 1; i >= pcol; i--)
+            l->c[i] = (i - n >= pcol) ? l->c[i - n] : blank;
+    }
+}
+
+static void pane_ins_del_lines(int n, int del)
+{
+    int save_top = pstop;
+    if (n < 1) n = 1;
+    if (prow < pstop || prow > psbot) return;
+    pstop = prow;
+    if (del) pane_scroll_up(n);
+    else pane_scroll_down(n);
+    pstop = save_top;
 }
 
 static void pane_csi(char final)
 {
-    int a = 0, has = 0, i;
-    PLine *l;
-    for (i = 0; i < pseqlen; i++) {
-        if (pseq[i] >= '0' && pseq[i] <= '9') {
-            a = a * 10 + (pseq[i] - '0');
-            has = 1;
-        } else {
-            break;
-        }
+    int v[24], om[24], n, a;
+    int priv = pseqlen > 0 && (pseq[0] == '?' || pseq[0] == '>' || pseq[0] == '=');
+    char kind = priv ? pseq[0] : 0;
+    if (priv) {
+        memmove(pseq, pseq + 1, (size_t)(pseqlen - 1));
+        pseqlen--;
     }
-    if (!has) a = 0;
-    if (pn == 0) pane_newline();
-    l = &pl[pcur];
+    n = pane_params(v, 24, om);
+    a = v[0];
+    pane_sync();
+    if (priv) {
+        int k;
+        if (final == 'h' || final == 'l') {
+            int on = final == 'h';
+            for (k = 0; k < n; k++) {
+                if (v[k] == 7) pautowrap = on;
+                else if (v[k] == 25) pcurvis = on;
+                else if (v[k] == 2004) pbracket = on;
+                else if (v[k] == 1049 || v[k] == 47 || v[k] == 1047) pane_alt(on);
+            }
+            return;
+        }
+        if (final == 'c' && E.panefd >= 0) {
+            if (kind == '>') pane_write("\x1b[>0;10;0c", 10);
+            else pane_write("\x1b[?1;2c", 7);
+        } else if (final == 'u' && E.panefd >= 0) {
+            pane_write("\x1b[?0u", 5);
+        }
+        return;
+    }
     switch (final) {
-    case 'K':
-        if (a == 0) {
-            if (l->len > pcx) l->len = pcx;
-        } else if (a == 1) {
-            for (i = 0; i < pcx && i < l->len; i++) l->s[i] = ' ';
-        } else {
-            l->len = 0;
-        }
-        l->s[l->len] = '\0';
+    case 'm':
+        pane_sgr(v, n);
         break;
-    case 'J':
-        if (a >= 2) {
-            pane_clear();
-            pane_newline();
-        }
+    case 'A':
+        prow -= a > 0 ? a : 1;
+        if (prow < 0) prow = 0;
+        pwrapnext = 0;
+        break;
+    case 'B':
+    case 'e':
+        prow += a > 0 ? a : 1;
+        if (prow >= pane_rows()) prow = pane_rows() - 1;
+        pwrapnext = 0;
         break;
     case 'C':
-        pcx += a > 0 ? a : 1;
+    case 'a':
+        pcol += a > 0 ? a : 1;
+        if (pcol >= pcols) pcol = pcols - 1;
+        pwrapnext = 0;
         break;
     case 'D':
-        pcx -= a > 0 ? a : 1;
-        if (pcx < 0) pcx = 0;
+        pcol -= a > 0 ? a : 1;
+        if (pcol < 0) pcol = 0;
+        pwrapnext = 0;
+        break;
+    case 'E':
+        prow += a > 0 ? a : 1;
+        if (prow >= pane_rows()) prow = pane_rows() - 1;
+        pcol = 0;
+        pwrapnext = 0;
+        break;
+    case 'F':
+        prow -= a > 0 ? a : 1;
+        if (prow < 0) prow = 0;
+        pcol = 0;
+        pwrapnext = 0;
         break;
     case 'G':
-        pcx = a > 0 ? a - 1 : 0;
+    case '`':
+        pcol = a > 0 ? a - 1 : 0;
+        if (pcol >= pcols) pcol = pcols - 1;
+        pwrapnext = 0;
+        break;
+    case 'd':
+        prow = a > 0 ? a - 1 : 0;
+        if (prow >= pane_rows()) prow = pane_rows() - 1;
+        pwrapnext = 0;
+        break;
+    case 'H':
+    case 'f':
+        prow = a > 0 ? a - 1 : 0;
+        pcol = (n > 1 && v[1] > 0) ? v[1] - 1 : 0;
+        if (prow >= pane_rows()) prow = pane_rows() - 1;
+        if (pcol >= pcols) pcol = pcols - 1;
+        if (prow < 0) prow = 0;
+        if (pcol < 0) pcol = 0;
+        pwrapnext = 0;
+        break;
+    case 'J':
+        pane_erase_display(om[0] ? 0 : a);
+        break;
+    case 'K':
+        pane_erase_line(om[0] ? 0 : a);
+        break;
+    case 'L':
+        pane_ins_del_lines(a, 0);
+        break;
+    case 'M':
+        pane_ins_del_lines(a, 1);
+        break;
+    case '@':
+        pane_ins_del_chars(a, 0);
+        break;
+    case 'P':
+        pane_ins_del_chars(a, 1);
+        break;
+    case 'X': {
+        int cnt = a > 0 ? a : 1;
+        pline_clear(pane_line(prow), pcol, pcol + cnt > pcols ? pcols : pcol + cnt);
+        break;
+    }
+    case 'S':
+        pane_scroll_up(a > 0 ? a : 1);
+        break;
+    case 'T':
+        pane_scroll_down(a > 0 ? a : 1);
+        break;
+    case 'r':
+        pstop = a > 0 ? a - 1 : 0;
+        psbot = (n > 1 && v[1] > 0) ? v[1] - 1 : pane_rows() - 1;
+        if (pstop < 0) pstop = 0;
+        if (psbot >= pane_rows()) psbot = pane_rows() - 1;
+        if (psbot <= pstop) { pstop = 0; psbot = pane_rows() - 1; }
+        prow = pstop;
+        pcol = 0;
+        pwrapnext = 0;
+        break;
+    case 's':
+        sv_prow = prow;
+        sv_pcol = pcol;
+        break;
+    case 'u':
+        prow = sv_prow;
+        pcol = sv_pcol;
+        if (prow >= pane_rows()) prow = pane_rows() - 1;
+        if (pcol >= pcols) pcol = pcols - 1;
         break;
     case 'c':
-        if (E.panefd >= 0) {
-            if (pseqlen > 0 && pseq[0] == '>') pane_write("\x1b[>0;10;0c", 10);
-            else if (pseqlen > 0 && pseq[0] == '=') pane_write("\x1bP!|00000000\x1b\\", 14);
-            else pane_write("\x1b[?1;2c", 7);
-        }
+        if (E.panefd >= 0) pane_write("\x1b[?1;2c", 7);
         break;
     case 'n':
         if (a == 5 && E.panefd >= 0) {
             pane_write("\x1b[0n", 4);
         } else if (a == 6 && E.panefd >= 0) {
             char rep[32];
-            int first = pn - E.panerows;
-            int n;
-            if (first < 0) first = 0;
-            n = snprintf(rep, sizeof rep, "\x1b[%d;%dR", pcur - first + 1, pcx + 1);
-            pane_write(rep, n);
+            int k = snprintf(rep, sizeof rep, "\x1b[%d;%dR", prow + 1, pcol + 1);
+            pane_write(rep, k);
         }
         break;
     default:
@@ -1522,20 +1957,35 @@ static void pane_csi(char final)
 
 static void pane_feed(const char *b, int n)
 {
+    static char mb[4];
+    static int mblen, mbwant;
     int i;
+    pane_sync();
     for (i = 0; i < n; i++) {
         unsigned char c = (unsigned char)b[i];
-        if (pstate == 1) {
-            if (c == '[') {
-                pstate = 2;
-                pseqlen = 0;
-            } else if (c == ']') {
-                pstate = 3;
-            } else if (c == '(' || c == ')' || c == '#' || c == '%') {
-                pstate = 4;
-            } else {
-                pstate = 0;
+        if (mblen > 0 && pstate == 0) {
+            if ((c & 0xc0) == 0x80 && mblen < mbwant) {
+                mb[mblen++] = (char)c;
+                if (mblen == mbwant) {
+                    pane_putcell(mb, mblen);
+                    mblen = 0;
+                }
+                continue;
             }
+            pane_putcell(mb, mblen);
+            mblen = 0;
+        }
+        if (pstate == 1) {
+            if (c == '[') { pstate = 2; pseqlen = 0; }
+            else if (c == ']') pstate = 3;
+            else if (c == '(' || c == ')' || c == '#' || c == '%') pstate = 4;
+            else if (c == '7') { sv_prow = prow; sv_pcol = pcol; pstate = 0; }
+            else if (c == '8') { prow = sv_prow; pcol = sv_pcol; pstate = 0; }
+            else if (c == 'M') { pane_rindex(); pstate = 0; }
+            else if (c == 'D') { pane_index(); pstate = 0; }
+            else if (c == 'E') { pcol = 0; pane_index(); pstate = 0; }
+            else if (c == 'c') { pane_clear(); pstate = 0; }
+            else pstate = 0;
             continue;
         }
         if (pstate == 2) {
@@ -1556,30 +2006,35 @@ static void pane_feed(const char *b, int n)
             pstate = 0;
             continue;
         }
-        if (c == 0x1b) {
-            pstate = 1;
+        if (c == 0x1b) { pstate = 1; continue; }
+        if (c == '\n' || c == 0x0b || c == 0x0c) {
+            pane_index();
+            pwrapnext = 0;
             continue;
         }
-        if (c == '\n') {
-            pane_newline();
-            continue;
-        }
-        if (c == '\r') {
-            pcx = 0;
-            continue;
-        }
+        if (c == '\r') { pcol = 0; pwrapnext = 0; continue; }
         if (c == '\b') {
-            if (pcx > 0) pcx--;
+            if (pwrapnext) pwrapnext = 0;
+            else if (pcol > 0) pcol--;
             continue;
         }
         if (c == '\t') {
-            do {
-                pane_put(' ');
-            } while (pcx % 8 != 0);
+            int stop = (pcol / 8 + 1) * 8;
+            if (stop > pcols - 1) stop = pcols - 1;
+            if (stop <= pcol) { pwrapnext = pautowrap; continue; }
+            while (pcol < stop) pane_putcell(" ", 1);
             continue;
         }
         if (c < 0x20 || c == 0x7f) continue;
-        pane_put((char)c);
+        if (c < 0x80) {
+            char one = (char)c;
+            pane_putcell(&one, 1);
+            continue;
+        }
+        mbwant = (c & 0xe0) == 0xc0 ? 2 : (c & 0xf0) == 0xe0 ? 3 : (c & 0xf8) == 0xf0 ? 4 : 1;
+        if (mbwant == 1) continue;
+        mb[0] = (char)c;
+        mblen = 1;
     }
 }
 
@@ -1590,6 +2045,8 @@ static void pane_resize(void)
     memset(&ws, 0, sizeof ws);
     ws.ws_row = (unsigned short)(E.panerows > 0 ? E.panerows : 1);
     ws.ws_col = (unsigned short)(E.cols > 0 ? E.cols : 80);
+    pcols = ws.ws_col;
+    pane_sync();
     ioctl(E.panefd, TIOCSWINSZ, &ws);
 }
 
@@ -1656,7 +2113,10 @@ static int file_shebang(const char *path, char *out, size_t n)
     *e = '\0';
     while (e > p && e[-1] == ' ') *--e = '\0';
     if (!*p) return 0;
-    snprintf(out, n, "%s", p);
+    /* Truncating the interpreter would build a command that cannot run, so a
+       shebang too long to hold is treated as no shebang at all. */
+    if (strlen(p) + 1 > n) return 0;
+    memcpy(out, p, strlen(p) + 1);
     return 1;
 }
 
@@ -1693,13 +2153,13 @@ static int build_run(char *cmd, size_t n, char *label, size_t ln)
             }
         }
         if (strcmp(ext, ".c") == 0) {
-            snprintf(cmd, n, "cc -O2 -Wall -o %s %s && %s", tq, q, tq);
+            snprintf(cmd, n, "cc -O2 -Wall -o %s %s -lm && %s", tq, q, tq);
             snprintf(label, ln, "cc + run %.60s", base);
             return 1;
         }
         if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 ||
             strcmp(ext, ".cxx") == 0) {
-            snprintf(cmd, n, "c++ -O2 -Wall -o %s %s && %s", tq, q, tq);
+            snprintf(cmd, n, "c++ -O2 -Wall -o %s %s -lm && %s", tq, q, tq);
             snprintf(label, ln, "c++ + run %.60s", base);
             return 1;
         }
@@ -1740,6 +2200,7 @@ static const char *shell_plain_flag(const char *sh)
 static int pane_spawn(const char *runcmd)
 {
     const char *sh = getenv("SHELL");
+    pbracket = 0;
     char *name;
     pid_t pid;
     int m, s;
@@ -1798,10 +2259,6 @@ static int pane_spawn(const char *runcmd)
         setenv("XXI_PANE", "1", 1);
         unsetenv("LINES");
         unsetenv("COLUMNS");
-        if (runcmd && *runcmd) {
-            execl("/bin/sh", "sh", "-c", runcmd, (char *)NULL);
-            _exit(127);
-        }
         if (flag) execl(sh, sh, flag, "-i", (char *)NULL);
         execl(sh, sh, "-i", (char *)NULL);
         execl("/bin/sh", "sh", "-i", (char *)NULL);
@@ -1818,6 +2275,13 @@ static int pane_spawn(const char *runcmd)
     pane_clear();
     pane_newline();
     pane_resize();
+    /* Hand the command to an interactive shell rather than running it as the
+       pane's whole life.  Interrupting it then lands on a prompt, the way it
+       would in any terminal, instead of killing the pane. */
+    if (runcmd && *runcmd) {
+        pane_write(runcmd, (int)strlen(runcmd));
+        pane_write("\n", 1);
+    }
     return 0;
 }
 
@@ -1916,6 +2380,8 @@ static void fix_layout(void)
     if (!E.paneopen) return;
     avail = E.rows - 1 - text_top() - 1;
     E.panerows = PANEROWS;
+    /* never let the runner eat more than half the window */
+    if (E.panerows > (E.rows - 2) / 2) E.panerows = (E.rows - 2) / 2;
     if (E.panerows > avail - 1) E.panerows = avail - 1;
     if (E.panerows < 1) E.panerows = 1;
 }
@@ -1986,11 +2452,13 @@ static const char *hints_pane[] = {
     "keys go to",
     "the program",
     "",
-    "drag   to copy",
+    "drag   copies",
+    "M-c    copy",
+    "M-v    paste",
     "wheel  scrolls",
     "",
     "^T   editor",
-    "^C   interrupt",
+    "^C   stop it",
     "esc  close",
     NULL
 };
@@ -1998,7 +2466,8 @@ static const char *hints_pane[] = {
 static const char *hints_done[] = {
     "OUTPUT",
     "",
-    "drag   to copy",
+    "drag   copies",
+    "M-c    copy it",
     "^C     copy it",
     "wheel  scrolls",
     "",
@@ -2174,6 +2643,37 @@ static void draw_text(Buf *ab)
     }
 }
 
+/* Write out the colour this cell was printed in. Always a full reset first,
+   so nothing leaks from the cell before it. */
+static void cell_sgr(Buf *ab, const Cell *c)
+{
+    char tmp[64];
+    bstr(ab, "\x1b[0");
+    if (c->fl & CA_BOLD) bstr(ab, ";1");
+    if (c->fl & CA_DIM) bstr(ab, ";2");
+    if (c->fl & CA_ITAL) bstr(ab, ";3");
+    if (c->fl & CA_UNDER) bstr(ab, ";4");
+    if (c->fl & CA_REV) bstr(ab, ";7");
+    if (c->fl & CA_STRIKE) bstr(ab, ";9");
+    if (c->fg & CC_RGB) {
+        snprintf(tmp, sizeof tmp, ";38;2;%u;%u;%u", (c->fg >> 16) & 0xffu,
+                 (c->fg >> 8) & 0xffu, c->fg & 0xffu);
+        bstr(ab, tmp);
+    } else if (c->fg & CC_IDX) {
+        snprintf(tmp, sizeof tmp, ";38;5;%u", c->fg & 0xffu);
+        bstr(ab, tmp);
+    }
+    if (c->bg & CC_RGB) {
+        snprintf(tmp, sizeof tmp, ";48;2;%u;%u;%u", (c->bg >> 16) & 0xffu,
+                 (c->bg >> 8) & 0xffu, c->bg & 0xffu);
+        bstr(ab, tmp);
+    } else if (c->bg & CC_IDX) {
+        snprintf(tmp, sizeof tmp, ";48;5;%u", c->bg & 0xffu);
+        bstr(ab, tmp);
+    }
+    bstr(ab, "m");
+}
+
 static void draw_pane(Buf *ab)
 {
     char head[256];
@@ -2210,32 +2710,38 @@ static void draw_pane(Buf *ab)
         bstr(ab, "\x1b[K");
         if (idx >= 0 && idx < pn) {
             PLine *l = &pl[idx];
-            int a = -1, b = -1, bi = 0, colc = 0, on = 0;
+            int a = -1, b = -1, cx, on = 0, penset = 0;
+            Cell pen;
+            memset(&pen, 0, sizeof pen);
             if (E.pselon && idx >= sy && idx <= ey) {
                 a = idx == sy ? sx : 0;
                 b = idx == ey ? ex : l->len;
                 if (a > l->len) a = l->len;
                 if (b > l->len) b = l->len;
             }
-            while (bi < l->len && colc < E.cols) {
-                int nx = bi + 1;
-                int want;
-                while (nx < l->len && u8_cont((unsigned char)l->s[nx])) nx++;
-                want = a >= 0 && bi >= a && bi < b;
+            for (cx = 0; cx < l->len && cx < E.cols; cx++) {
+                const Cell *c = &l->c[cx];
+                int want = a >= 0 && cx >= a && cx < b;
                 if (want != on) {
                     bstr(ab, want ? c_sel : c_off);
                     on = want;
+                    penset = 0;
                 }
-                bput(ab, l->s + bi, nx - bi);
-                bi = nx;
-                colc++;
+                if (!on && (!penset || c->fl != pen.fl || c->fg != pen.fg ||
+                            c->bg != pen.bg)) {
+                    cell_sgr(ab, c);
+                    pen = *c;
+                    penset = 1;
+                }
+                if (c->n == 0) bput(ab, " ", 1);
+                else bput(ab, c->b, c->n);
             }
-            if (a >= 0 && b > l->len - 1 && idx != ey && colc < E.cols) {
-                bstr(ab, c_sel);
+            if (a >= 0 && b > l->len && idx != ey && l->len < E.cols) {
+                if (!on) bstr(ab, c_sel);
                 bput(ab, " ", 1);
                 on = 1;
             }
-            if (on) bstr(ab, c_off);
+            bstr(ab, c_off);
         }
         bstr(ab, "\r\n");
     }
@@ -2322,10 +2828,9 @@ static void place_cursor(Buf *ab)
 {
     int row, col;
     if (E.paneopen && E.panefocus) {
-        int first = pn - E.panerows;
-        if (first < 0) first = 0;
-        row = text_top() + text_height() + 2 + (pcur - first);
-        col = pcx + 1;
+        int first = pane_first();
+        row = text_top() + text_height() + 2 + (ptop + prow - first);
+        col = pcol + 1;
     } else if (E.findopen) {
         row = 1;
         col = 8 + E.findlen;
@@ -2353,7 +2858,8 @@ static void draw(void)
     if (E.paneopen) draw_pane(&ab);
     draw_status(&ab);
     place_cursor(&ab);
-    bstr(&ab, "\x1b[?25h");
+    /* a full-screen program in the pane can ask for the cursor to go away */
+    bstr(&ab, E.paneopen && E.panefocus && !pcurvis ? "\x1b[?25l" : "\x1b[?25h");
     emitn(ab.b, ab.len);
     free(ab.b);
 }
@@ -2376,6 +2882,90 @@ static int stdin_ready(int ms)
     return poll(&p, 1, ms) == 1 && (p.revents & POLLIN);
 }
 
+/* CSI <code> ; <mods> u.  mods is a 1-based bitmask: 1 shift, 2 alt, 4 ctrl. */
+static void csiu_parse(const char *p, int *code, int *mods)
+{
+    int i = 0;
+    *code = 0;
+    *mods = 0;
+    while (p[i] >= '0' && p[i] <= '9') *code = *code * 10 + (p[i++] - '0');
+    while (p[i] && p[i] != ';') i++;
+    if (p[i] == ';') {
+        i++;
+        while (p[i] >= '0' && p[i] <= '9') *mods = *mods * 10 + (p[i++] - '0');
+    }
+    *mods = *mods > 0 ? *mods - 1 : 0;
+}
+
+/* Fold a protocol key back into the key XXI already understands, so nothing
+   downstream has to know the protocol is on. */
+static int csiu_key(const char *p)
+{
+    int code, mods;
+    csiu_parse(p, &code, &mods);
+    if ((mods & (KM_CTRL | KM_SHIFT)) == (KM_CTRL | KM_SHIFT)) {
+        if (code == 'c' || code == 'C') return K_COPY;
+        if (code == 'v' || code == 'V') return K_PASTE;
+    }
+    if (code == 27) return '\x1b';
+    if (code == 13) return '\r';
+    if (code == 9) return '\t';
+    if (code == 127) return K_BACKSPACE;
+    if (mods & KM_ALT) return code < 128 ? K_ALT(code) : -1;
+    if (mods & KM_CTRL) {
+        if (code == ' ') return 0;
+        if ((code >= 'a' && code <= 'z') || (code >= '@' && code <= '_'))
+            return KCTRL(code);
+        return -1;
+    }
+    return code < 128 ? code : -1;
+}
+
+/* And back into the bytes an ordinary program expects, for the pane. */
+static int csiu_bytes(const char *p, char *dst)
+{
+    int code, mods, n = 0;
+    csiu_parse(p, &code, &mods);
+    if (mods & KM_ALT) dst[n++] = '\x1b';
+    if (code == 27) { dst[n++] = '\x1b'; return n; }
+    if (code == 13) { dst[n++] = '\r'; return n; }
+    if (code == 9) { dst[n++] = '\t'; return n; }
+    if (code == 127) { dst[n++] = 127; return n; }
+    if (mods & KM_CTRL) {
+        if (code == ' ') { dst[n++] = 0; return n; }
+        if ((code >= 'a' && code <= 'z') || (code >= '@' && code <= '_')) {
+            dst[n++] = (char)(code & 0x1f);
+            return n;
+        }
+    }
+    if (code < 128) { dst[n++] = (char)code; return n; }
+    if (code < 0x800) {
+        dst[n++] = (char)(0xc0 | (code >> 6));
+        dst[n++] = (char)(0x80 | (code & 0x3f));
+    } else {
+        dst[n++] = (char)(0xe0 | (code >> 12));
+        dst[n++] = (char)(0x80 | ((code >> 6) & 0x3f));
+        dst[n++] = (char)(0x80 | (code & 0x3f));
+    }
+    return n;
+}
+
+/* A whole CSI u sequence at the front of these bytes, or 0. */
+static int csiu_seq(const char *b, int n, int *used, char *param, int psize)
+{
+    int i = 2, k = 0;
+    if (n < 4 || b[0] != '\x1b' || b[1] != '[') return 0;
+    if (b[2] == '<' || b[2] == '?' || b[2] == '>') return 0;
+    while (i < n && !((unsigned char)b[i] >= 0x40 && (unsigned char)b[i] <= 0x7e)) {
+        if (k < psize - 1) param[k++] = b[i];
+        i++;
+    }
+    if (i >= n || b[i] != 'u') return 0;
+    param[k] = '\0';
+    *used = i + 1;
+    return 1;
+}
+
 static int read_key(void)
 {
     char seq[4];
@@ -2391,6 +2981,7 @@ static int read_key(void)
     }
     if (c != '\x1b') return (unsigned char)c;
     if (!stdin_ready(40) || read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+    if (seq[0] != '[' && seq[0] != 'O') return K_ALT(seq[0]);
     if (!stdin_ready(40) || read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
     if (seq[0] == '[' && seq[1] == '<') {
         char m[40];
@@ -2427,6 +3018,7 @@ static int read_key(void)
             default: return -1;
             }
         }
+        if (fin == 'u') return csiu_key(p);
         switch (fin) {
         case 'A': return K_UP;
         case 'B': return K_DOWN;
@@ -2519,7 +3111,8 @@ static void mouse_to_pane(int mx, int my, int *ly, int *lx)
     *ly = first + row;
     if (*ly >= pn) *ly = pn > 0 ? pn - 1 : 0;
     if (*ly < 0) *ly = 0;
-    *lx = pn > 0 ? pane_col_to_byte(&pl[*ly], mx > 0 ? mx - 1 : 0) : 0;
+    *lx = mx > 0 ? mx - 1 : 0;
+    if (pn > 0 && *lx > pl[*ly].len) *lx = pl[*ly].len;
 }
 
 static void handle_mouse(void)
@@ -2549,6 +3142,10 @@ static void handle_mouse(void)
     }
     if (btn != 0) return;
     if (!ms_press) {
+        /* Letting go of a drag in the terminal copies it. Every terminal
+           emulator keeps ctrl+shift+c for itself, so a key we can rely on
+           everywhere does not exist - but letting go of the mouse does. */
+        if (E.pdrag && E.pselon) cmd_copy_pane();
         E.dragging = 0;
         E.dragedge = 0;
         E.pdrag = 0;
@@ -2569,7 +3166,6 @@ static void handle_mouse(void)
             E.psby = y;
             E.psbx = x;
             E.pselon = 1;
-            E.panefocus = 0;
             if (ms_y <= head + 1) E.pedge = -1;
             else if (ms_y >= head + E.panerows) E.pedge = 1;
             else E.pedge = 0;
@@ -2723,7 +3319,8 @@ static void process_key(void)
         handle_mouse();
         return;
     }
-    if (c != KCTRL('c')) {
+    if (c != KCTRL('c') && c != KCTRL('t') && c != K_COPY &&
+        c != K_ALT('c') && c != K_ALT('C')) {
         E.marked = 0;
         E.pselon = 0;
     }
@@ -2745,6 +3342,17 @@ static void process_key(void)
         else cmd_copy();
         break;
     case KCTRL('v'):
+        cmd_paste();
+        break;
+    case K_COPY:
+    case K_ALT('c'):
+    case K_ALT('C'):
+        if (E.pselon) cmd_copy_pane();
+        else cmd_copy();
+        break;
+    case K_PASTE:
+    case K_ALT('v'):
+    case K_ALT('V'):
         cmd_paste();
         break;
     case KCTRL('k'):
@@ -2844,51 +3452,220 @@ static void process_key(void)
     case KCTRL('l'):
         break;
     default:
-        if (E.mode == MODE_SELECT) break;
-        if (c == '\t' || (c >= 32 && c < 1000)) cmd_insert_char(c);
+        if (c != '\t' && (c < 32 || c >= 1000)) break;
+        if (E.mode == MODE_SELECT) E.mode = MODE_EDIT;
+        cmd_insert_char(c);
         break;
     }
 }
 
+static void pane_paste(void)
+{
+    int len = 0, i, kept = 0;
+    char *s = clip_get(&len);
+    if (!s || len == 0) {
+        free(s);
+        set_msg("clipboard is empty");
+        return;
+    }
+    for (i = 0; i < len; i++) {
+        char ch = s[i];
+        if (ch == '\r') continue;
+        if (ch == '\n') ch = '\r';
+        s[kept++] = ch;
+    }
+    len = kept;
+    if (len == 0) {
+        free(s);
+        set_msg("clipboard is empty");
+        return;
+    }
+    if (pbracket) pane_write("\x1b[200~", 6);
+    pane_write(s, len);
+    if (pbracket) pane_write("\x1b[201~", 6);
+    free(s);
+    set_msg("pasted %d byte%s into the terminal", len, plural(len));
+}
+
+/* True when these bytes are the beginning of an escape sequence whose end
+   has not arrived yet.  A mouse report can straddle two reads, and writing
+   half of one into the program types garbage at its prompt. */
+static int esc_partial(const char *b, int n)
+{
+    int i;
+    if (n <= 0 || b[0] != '\x1b') return 0;
+    if (n == 1) return 1;
+    if (b[1] != '[') return 0;
+    for (i = 2; i < n; i++)
+        if ((unsigned char)b[i] >= 0x40 && (unsigned char)b[i] <= 0x7e) return 0;
+    return 1;
+}
+
+/* A whole SGR mouse report, or 0 if these bytes are not one. */
+static int pane_mouse_seq(const char *b, int n, int *used)
+{
+    char m[40];
+    int j = 3, k;
+    if (n < 4 || b[0] != '\x1b' || b[1] != '[' || b[2] != '<') return 0;
+    while (j < n && b[j] != 'M' && b[j] != 'm') j++;
+    if (j >= n) return 0;
+    k = j - 3;
+    if (k >= (int)sizeof m) k = (int)sizeof m - 1;
+    memcpy(m, b + 3, (size_t)k);
+    m[k] = '\0';
+    if (sscanf(m, "%d;%d;%d", &ms_b, &ms_x, &ms_y) == 3) {
+        ms_press = b[j] == 'M';
+        handle_mouse();
+    }
+    *used = j + 1;
+    return 1;
+}
+
+static char pstash[32];
+static int pstashlen;
+
 static void pane_keys(void)
 {
-    char b[512];
-    ssize_t r = read(STDIN_FILENO, b, sizeof b);
-    int i = 0, start = 0;
-    if (r <= 0) return;
-    while (i < (int)r) {
-        if (b[i] == KCTRL('t')) {
-            if (i > start) pane_write(b + start, i - start);
-            E.panefocus = 0;
-            set_msg("editor focused  - ^T returns to the terminal");
-            return;
+    char b[640];
+    char out[640];
+    char prm[48];
+    int outlen = 0, r, i = 0, leave = 0;
+    ssize_t got;
+    memcpy(b, pstash, (size_t)pstashlen);
+    got = read(STDIN_FILENO, b + pstashlen, sizeof b - (size_t)pstashlen);
+    if (got < 0) got = 0;
+    r = pstashlen + (int)got;
+    pstashlen = 0;
+    if (r == 0) return;
+    while (i < r) {
+        unsigned char c = (unsigned char)b[i];
+        if (c == KCTRL('t')) {
+            leave = 1;
+            break;
         }
-        if (b[i] == '\x1b' && i + 2 < (int)r && b[i + 1] == '[' && b[i + 2] == '<') {
-            int j = i + 3;
-            while (j < (int)r && b[j] != 'M' && b[j] != 'm') j++;
-            if (j < (int)r) {
-                char save = b[j];
-                if (i > start) pane_write(b + start, i - start);
-                b[j] = '\0';
-                if (sscanf(b + i + 3, "%d;%d;%d", &ms_b, &ms_x, &ms_y) == 3) {
-                    ms_press = save == 'M';
-                    handle_mouse();
+        if (c == KCTRL('v')) {
+            if (outlen) {
+                pane_write(out, outlen);
+                outlen = 0;
+                E.pselon = 0;
+                E.paneoff = 0;
+            }
+            pane_paste();
+            i++;
+            continue;
+        }
+        if (c == 0x1b) {
+            int used = 0;
+            if (pane_mouse_seq(b + i, r - i, &used)) {
+                if (outlen) {
+                    pane_write(out, outlen);
+                    outlen = 0;
+                    E.pselon = 0;
+                    E.paneoff = 0;
                 }
-                i = j + 1;
-                start = i;
-                if (!E.panefocus) return;
+                i += used;
+                if (!E.paneopen || !E.panefocus) return;
                 continue;
             }
+            if (csiu_seq(b + i, r - i, &used, prm, sizeof prm)) {
+                int code, mods, nb, j, ctrlshift, isalt;
+                char enc[8];
+                csiu_parse(prm, &code, &mods);
+                ctrlshift = (mods & (KM_CTRL | KM_SHIFT)) == (KM_CTRL | KM_SHIFT);
+                isalt = (mods & KM_ALT) != 0;
+                if (code == 27 && mods == 0) {
+                    if (palt) {
+                        out[outlen++] = '\x1b';
+                        i += used;
+                        continue;
+                    }
+                    if (outlen) pane_write(out, outlen);
+                    pane_close();
+                    set_msg("terminal closed");
+                    return;
+                }
+                if ((mods & KM_CTRL) && !(mods & KM_SHIFT) && code == 't') {
+                    leave = 1;
+                    break;
+                }
+                if ((ctrlshift || isalt) && (code == 'c' || code == 'C')) {
+                    cmd_copy_pane();
+                    i += used;
+                    continue;
+                }
+                if (((ctrlshift || isalt) && (code == 'v' || code == 'V')) ||
+                    ((mods & KM_CTRL) && !(mods & KM_SHIFT) && code == 'v')) {
+                    if (outlen) {
+                        pane_write(out, outlen);
+                        outlen = 0;
+                        E.pselon = 0;
+                        E.paneoff = 0;
+                    }
+                    pane_paste();
+                    i += used;
+                    continue;
+                }
+                nb = csiu_bytes(prm, enc);
+                for (j = 0; j < nb && outlen < (int)sizeof out; j++)
+                    out[outlen++] = enc[j];
+                i += used;
+                continue;
+            }
+            if (i + 1 < r && (b[i + 1] == 'c' || b[i + 1] == 'C')) {
+                if (outlen) {
+                    pane_write(out, outlen);
+                    outlen = 0;
+                    E.pselon = 0;
+                }
+                cmd_copy_pane();
+                i += 2;
+                continue;
+            }
+            if (i + 1 < r && (b[i + 1] == 'v' || b[i + 1] == 'V')) {
+                if (outlen) {
+                    pane_write(out, outlen);
+                    outlen = 0;
+                    E.pselon = 0;
+                }
+                pane_paste();
+                i += 2;
+                continue;
+            }
+            if (esc_partial(b + i, r - i)) {
+                int left = r - i;
+                if (left == 1 && !stdin_ready(50)) {
+                    /* A full-screen program owns esc - it is how you leave
+                       insert mode.  Closing the pane would be maddening, so
+                       pass it through and let ^T get you out instead. */
+                    if (palt) {
+                        out[outlen++] = '\x1b';
+                        i++;
+                        continue;
+                    }
+                    if (outlen) pane_write(out, outlen);
+                    pane_close();
+                    set_msg("terminal closed");
+                    return;
+                }
+                if (left <= (int)sizeof pstash) {
+                    memcpy(pstash, b + i, (size_t)left);
+                    pstashlen = left;
+                    break;
+                }
+            }
         }
-        if (b[i] == '\x1b' && i == (int)r - 1 && !stdin_ready(50)) {
-            if (i > start) pane_write(b + start, i - start);
-            pane_close();
-            set_msg("terminal closed");
-            return;
-        }
+        out[outlen++] = (char)c;
         i++;
     }
-    pane_write(b + start, (int)r - start);
+    if (outlen) {
+        pane_write(out, outlen);
+        E.pselon = 0;
+        E.paneoff = 0;   /* typing jumps back to the live screen, like any terminal */
+    }
+    if (leave) {
+        E.panefocus = 0;
+        set_msg("editor focused  - ^T returns to the terminal");
+    }
 }
 
 static void on_winch(int sig)
@@ -2940,6 +3717,7 @@ int main(int argc, char **argv)
     detect_borders();
     update_size();
     open_file(argv[1]);
+    set_title();
     E.savepoint = 0;
     mark_dirty();
     for (;;) {
